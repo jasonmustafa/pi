@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
 import { promises as dns } from "node:dns";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
@@ -24,8 +26,10 @@ const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const SEARCH_TIMEOUT_MS = 60_000;
 const FETCH_TIMEOUT_MS = 30_000;
 const MAX_FETCH_BYTES = 5 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
 const MAX_FRAMES = 12;
 const CACHE_DIR = join(homedir(), ".pi", "agent", "web-cache");
+const ENABLE_JINA_READER = /^(1|true|yes)$/i.test(process.env.PI_WEB_ACCESS_ENABLE_JINA_READER ?? "");
 
 function preferredCommand(name: string): string {
 	const local = join(homedir(), ".local", "bin", name);
@@ -78,6 +82,14 @@ interface ContentItemResult {
 	text: string;
 	details: TextResultDetails;
 	images?: Array<{ type: "image"; data: string; mimeType: string }>;
+}
+
+interface PublicHttpResponse {
+	ok: boolean;
+	status: number;
+	statusText: string;
+	headers: { get(name: string): string | null };
+	text(): Promise<string>;
 }
 
 function combinedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
@@ -517,7 +529,7 @@ function isBlockedAddress(address: string): boolean {
 	return true;
 }
 
-async function validatePublicHttpUrl(rawUrl: string | URL): Promise<URL> {
+async function resolvePublicHttpUrl(rawUrl: string | URL): Promise<{ url: URL; address: string; family: 4 | 6 }> {
 	const url = rawUrl instanceof URL ? rawUrl : new URL(rawUrl);
 	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error(`Unsupported URL protocol: ${url.protocol}`);
 	const host = url.hostname.toLowerCase();
@@ -530,7 +542,103 @@ async function validatePublicHttpUrl(rawUrl: string | URL): Promise<URL> {
 	for (const record of records) {
 		if (isBlockedAddress(record.address)) throw new Error(`Blocked private/reserved address for ${host}: ${record.address}`);
 	}
-	return url;
+	const first = records[0];
+	if (first.family !== 4 && first.family !== 6) throw new Error(`Unsupported DNS address family for ${host}: ${first.family}`);
+	return { url, address: first.address, family: first.family };
+}
+
+async function validatePublicHttpUrl(rawUrl: string | URL): Promise<URL> {
+	return (await resolvePublicHttpUrl(rawUrl)).url;
+}
+
+function isRedirectStatus(status: number): boolean {
+	return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function normalizeRequestHeaders(headers: HeadersInit | undefined): Record<string, string> {
+	if (!headers) return {};
+	if (headers instanceof Headers) return Object.fromEntries(headers.entries());
+	if (Array.isArray(headers)) return Object.fromEntries(headers.map(([key, value]) => [key, value]));
+	return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)]));
+}
+
+function headerGetter(headers: Record<string, string | string[] | undefined>): { get(name: string): string | null } {
+	return {
+		get(name: string): string | null {
+			const value = headers[name.toLowerCase()];
+			if (Array.isArray(value)) return value.join(", ");
+			return value ?? null;
+		},
+	};
+}
+
+async function requestPinnedPublicHttpUrl(url: URL, address: string, family: 4 | 6, init: RequestInit, signal?: AbortSignal): Promise<PublicHttpResponse> {
+	return new Promise((resolvePromise, reject) => {
+		const request = url.protocol === "https:" ? httpsRequest : httpRequest;
+		const req = request({
+			protocol: url.protocol,
+			hostname: url.hostname,
+			port: url.port || undefined,
+			path: `${url.pathname}${url.search}`,
+			method: init.method ?? "GET",
+			headers: normalizeRequestHeaders(init.headers),
+			servername: url.hostname,
+			lookup: (_hostname, _options, callback) => callback(null, address, family),
+		}, res => {
+			const chunks: Buffer[] = [];
+			let bytes = 0;
+			res.on("data", chunk => {
+				const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+				bytes += buffer.length;
+				if (bytes > MAX_FETCH_BYTES) {
+					req.destroy(new Error(`Response too large (${formatSize(bytes)})`));
+					return;
+				}
+				chunks.push(buffer);
+			});
+			res.on("end", () => {
+				const status = res.statusCode ?? 0;
+				const body = Buffer.concat(chunks).toString("utf8");
+				resolvePromise({
+					ok: status >= 200 && status < 300,
+					status,
+					statusText: res.statusMessage ?? "",
+					headers: headerGetter(res.headers),
+					text: async () => body,
+				});
+			});
+		});
+		req.on("error", reject);
+		req.setTimeout(FETCH_TIMEOUT_MS, () => req.destroy(new Error(`Request timed out after ${FETCH_TIMEOUT_MS}ms`)));
+		if (signal) {
+			if (signal.aborted) req.destroy(new Error("Request aborted"));
+			else signal.addEventListener("abort", () => req.destroy(new Error("Request aborted")), { once: true });
+		}
+		req.end();
+	});
+}
+
+async function fetchPublicHttpUrl(rawUrl: string | URL, init: RequestInit = {}, signal?: AbortSignal): Promise<{ response: PublicHttpResponse; url: URL }> {
+	let url = rawUrl instanceof URL ? rawUrl : new URL(rawUrl);
+	for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
+		// Validate DNS immediately before every request and pin the socket to that
+		// validated address, then handle redirects manually to avoid SSRF pivots.
+		const resolved = await resolvePublicHttpUrl(url);
+		url = resolved.url;
+		const response = await requestPinnedPublicHttpUrl(url, resolved.address, resolved.family, init, signal);
+		if (!isRedirectStatus(response.status)) return { response, url };
+		const location = response.headers.get("location");
+		if (!location) return { response, url };
+		if (redirectCount === MAX_REDIRECTS) throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
+		url = new URL(location, url);
+	}
+	throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
+}
+
+function shouldSkipThirdPartyReader(rawUrl: string | URL): boolean {
+	const url = rawUrl instanceof URL ? rawUrl : new URL(rawUrl);
+	if (url.username || url.password || url.search || url.hash) return true;
+	return false;
 }
 
 function decodeHtmlEntities(text: string): string {
@@ -575,33 +683,32 @@ function htmlToText(html: string): { title: string; content: string } {
 
 async function fetchJinaReader(url: string, signal?: AbortSignal): Promise<ContentItemResult | null> {
 	try {
-		await validatePublicHttpUrl(url);
-		const response = await fetch(`https://r.jina.ai/${url}`, {
+		if (!ENABLE_JINA_READER) return null;
+		const targetUrl = await validatePublicHttpUrl(url);
+		if (shouldSkipThirdPartyReader(targetUrl)) return null;
+		const { response } = await fetchPublicHttpUrl(`https://r.jina.ai/${targetUrl.toString()}`, {
 			headers: { Accept: "text/markdown", "X-No-Cache": "true" },
-			signal: combinedSignal(signal, FETCH_TIMEOUT_MS),
-		});
+		}, signal);
 		if (!response.ok) return null;
 		const raw = await response.text();
 		const marker = raw.indexOf("Markdown Content:");
 		const markdown = marker >= 0 ? raw.slice(marker + "Markdown Content:".length).trim() : raw.trim();
 		if (markdown.length < 100) return null;
-		const title = raw.match(/^Title:\s*(.+)$/m)?.[1]?.trim() || new URL(url).hostname;
-		return makeTextResult("url", title, markdown, { url, extraction: "jina-reader" });
+		const title = raw.match(/^Title:\s*(.+)$/m)?.[1]?.trim() || targetUrl.hostname;
+		return makeTextResult("url", title, markdown, { url: targetUrl.toString(), extraction: "jina-reader" });
 	} catch {
 		return null;
 	}
 }
 
 async function fetchHttpContent(rawUrl: string, signal?: AbortSignal): Promise<ContentItemResult> {
-	const url = await validatePublicHttpUrl(rawUrl);
-	const response = await fetch(url, {
+	const { response, url } = await fetchPublicHttpUrl(rawUrl, {
 		headers: {
 			"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36 pi-web-access-lite",
 			Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,application/json;q=0.8,*/*;q=0.5",
 			"Accept-Language": "en-US,en;q=0.9",
 		},
-		signal: combinedSignal(signal, FETCH_TIMEOUT_MS),
-	});
+	}, signal);
 	if (!response.ok) {
 		const jina = await fetchJinaReader(url.toString(), signal);
 		if (jina) return jina;
@@ -889,7 +996,7 @@ function chooseCaptionTrack(metadata: any): { url: string; ext?: string; languag
 async function fetchTranscriptFromMetadata(metadata: any, signal?: AbortSignal): Promise<{ transcript: string; language?: string; automatic?: boolean } | null> {
 	const track = chooseCaptionTrack(metadata);
 	if (!track) return null;
-	const response = await fetch(track.url, { signal: combinedSignal(signal, 30_000) });
+	const { response } = await fetchPublicHttpUrl(track.url, {}, signal);
 	if (!response.ok) return null;
 	const raw = await response.text();
 	let transcript = "";
@@ -1049,7 +1156,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "fetch_content",
 		label: "Fetch Content",
-		description: "Fetch URL content as text/markdown. GitHub repository URLs are cloned locally and return a path. YouTube URLs use yt-dlp transcripts when available, OpenAI web-search fallback otherwise, and can extract frames with yt-dlp+ffmpeg. Output is truncated to 2000 lines/50KB; full text is saved to a temp file when truncated.",
+		description: "Fetch URL content as text/markdown. GitHub repository URLs are cloned locally and return a path. YouTube URLs use yt-dlp transcripts when available, OpenAI web-search fallback otherwise, and can extract frames with yt-dlp+ffmpeg. HTTP redirects are revalidated for SSRF protection. Output is truncated to 2000 lines/50KB; full text is saved to a temp file when truncated.",
 		promptSnippet: "Fetch specific URLs, clone GitHub repos locally, or inspect YouTube transcripts/frames.",
 		promptGuidelines: [
 			"Use fetch_content when the user provides a URL or when web_search returns a source URL that needs detailed inspection.",
@@ -1103,6 +1210,7 @@ export default function (pi: ExtensionAPI) {
 				`git: ${await commandExists(GIT) ? `available (${GIT})` : "missing"}`,
 				`yt-dlp: ${await commandExists(YT_DLP) ? `available (${YT_DLP})` : "missing"}`,
 				`ffmpeg: ${await commandExists(FFMPEG, ["-version"]) ? `available (${FFMPEG})` : "missing"}`,
+				`Jina Reader fallback: ${ENABLE_JINA_READER ? "enabled" : "disabled"}`,
 				`cache: ${CACHE_DIR}`,
 			];
 			ctx.ui.notify(lines.join("\n"), auth ? "info" : "warning");
