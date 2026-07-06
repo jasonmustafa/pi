@@ -1,0 +1,15 @@
+{
+  "name": "@jasonmustafa/pi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal Pi extensions and resources.",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/*/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
