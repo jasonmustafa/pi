@@ -5,7 +5,7 @@ import { request as httpsRequest } from "node:https";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -28,7 +28,20 @@ const FETCH_TIMEOUT_MS = 30_000;
 const MAX_FETCH_BYTES = 5 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
 const MAX_FRAMES = 12;
-const CACHE_DIR = join(homedir(), ".pi", "agent", "web-cache");
+const DEFAULT_CACHE_DIR = join(homedir(), ".pi", "agent", "web-cache");
+
+function resolveCacheDir(): string {
+	const configured = process.env.PI_WEB_ACCESS_CACHE_DIR?.trim()
+		|| process.env.CLANK_WEB_ACCESS_CACHE_DIR?.trim();
+	if (configured) return resolve(configured);
+
+	const clankWorkspaceRoot = process.env.CLANK_WORKSPACE_ROOT?.trim();
+	if (clankWorkspaceRoot) return resolve(clankWorkspaceRoot, ".web-cache");
+
+	return DEFAULT_CACHE_DIR;
+}
+
+const CACHE_DIR = resolveCacheDir();
 const ENABLE_JINA_READER = /^(1|true|yes)$/i.test(process.env.PI_WEB_ACCESS_ENABLE_JINA_READER ?? "");
 
 function preferredCommand(name: string): string {
@@ -144,7 +157,9 @@ async function commandExists(command: string, args = ["--version"]): Promise<boo
 }
 
 async function writeFullText(prefix: string, content: string): Promise<string> {
-	const dir = await mkdtemp(join(tmpdir(), `pi-${prefix}-`));
+	const root = join(CACHE_DIR, "full-content");
+	await mkdir(root, { recursive: true });
+	const dir = await mkdtemp(join(root, `pi-${prefix}-`));
 	const file = join(dir, "content.md");
 	await writeFile(file, content, "utf8");
 	return file;
