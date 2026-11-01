@@ -13,6 +13,16 @@ pi install ~/Projects/pi
 
 ## Extensions
 
+- `rounded-editor`: Frames the native input editor with rounded corners
+  (`╭╮╰╯`) and vertical sides, keeping the active theme, shortcuts, scroll
+  indicators, completion menu, and mouse cursor placement. Run `/reload` after
+  adding it; this package already discovers `extensions/*/index.ts`.
+  For full UI alternatives in the [Pi theme catalog](https://pi.dev/packages?type=theme),
+  see [pi-open-tui](https://github.com/OldSuns/pi-open-tui) (rounded editor,
+  header, and footer) and [pi-zentui](https://github.com/lmilojevicc/pi-zentui)
+  (modular UI components). This extension only changes the editor frame;
+  don't enable multiple editor replacements together.
+
 - `web-access`: OpenAI/Codex web search, URL fetching, GitHub repo cloning, and
   YouTube transcript/frame helpers.
 - `discord-presence`: Discord Rich Presence for interactive Pi sessions. Shows
