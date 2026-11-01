@@ -23,8 +23,6 @@ pi install ~/Projects/pi
   (modular UI components). This extension only changes the editor frame;
   don't enable multiple editor replacements together.
 
-- `web-access`: OpenAI/Codex web search, URL fetching, GitHub repo cloning, and
-  YouTube transcript/frame helpers.
 - `discord-presence`: Discord Rich Presence for interactive Pi sessions. Shows
   live activity like editing a file, running commands, browsing, thinking, and
   idle status without broadcasting file names or project directory names. Idle
